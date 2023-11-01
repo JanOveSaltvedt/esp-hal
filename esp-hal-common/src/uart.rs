@@ -1253,7 +1253,6 @@ mod asynch {
     use core::{marker::PhantomData, task::Poll};
 
     use cfg_if::cfg_if;
-    use embassy_futures::select::{select, select3, Either, Either3};
     use embassy_sync::waitqueue::AtomicWaker;
     use procmacros::interrupt;
 
@@ -1440,60 +1439,48 @@ mod asynch {
     where
         T: Instance,
     {
-        /// Read async to buffer slice `buf`. Wait for Rx Fifo Full interrupt
-        /// (set by `set_rx_fifo_full_threshold`) and/or Rx AT_CMD character
-        /// interrupt if `set_at_cmd` was called.
+        /// Read async to buffer slice `buf`.
+        /// If data is in the fifo, returns it right away.
+        /// Otherwise, sets rx_fifo_full_threshold to 1 and waits for the
+        /// interrupt to occur
         ///
         /// # Params
         /// - `buf` buffer slice to write the bytes into
         ///
-        /// # Errors
-        /// - `Err(RxFifoOvf)` when MCU Rx Fifo Overflow interrupt is triggered.
-        ///   To avoid this error, call this function more often.
-        /// - `Err(Error::ReadNoConfig)` if neither `set_rx_fifo_full_threshold`
-        ///   or `set_at_cmd` was called
-        ///
         /// # Ok
-        /// When succesfull, returns the number of bytes written to
-        /// buf
+        /// When successful, returns the number of bytes written to buf
+        /// TODO: Support waiting on at cmd or rx fifo full interrupt
         async fn read_async(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
             if buf.len() == 0 {
                 return Ok(0);
             }
 
-            let mut read_bytes = 0;
+            loop {
+                let mut read_bytes = 0;
 
-            if self.at_cmd_config.is_some() {
-                if let Either3::Third(_) = select3(
-                    UartFuture::<T>::new(Event::RxCmdCharDetected),
-                    UartFuture::<T>::new(Event::RxFifoFull),
-                    UartFuture::<T>::new(Event::RxFifoOvf),
-                )
-                .await
-                {
-                    return Err(Error::RxFifoOvf);
-                }
-            } else {
-                if let Either::Second(_) = select(
-                    UartFuture::<T>::new(Event::RxFifoFull),
-                    UartFuture::<T>::new(Event::RxFifoOvf),
-                )
-                .await
-                {
-                    return Err(Error::RxFifoOvf);
-                }
-            }
-
-            while let Ok(byte) = self.read_byte() {
-                if read_bytes < buf.len() {
-                    buf[read_bytes] = byte;
+                while read_bytes < buf.len() && T::get_rx_fifo_count() > 0 {
+                    let value = unsafe {
+                        let fifo = (T::register_block().fifo.as_ptr() as *mut u8)
+                            as *mut crate::peripherals::generic::Reg<
+                                crate::peripherals::uart0::fifo::FIFO_SPEC,
+                            >;
+                        (*fifo).read().rxfifo_rd_byte().bits()
+                    };
+                    buf[read_bytes] = value;
                     read_bytes += 1;
-                } else {
-                    break;
                 }
-            }
 
-            Ok(read_bytes)
+                if read_bytes > 0 {
+                    return Ok(read_bytes);
+                }
+
+                // Setup wait for at least one byte
+                T::register_block()
+                    .conf1
+                    .modify(|_, w| unsafe { w.rxfifo_full_thrhd().bits(1) });
+
+                UartFuture::<T>::new(Event::RxFifoFull).await;
+            }
         }
     }
 
