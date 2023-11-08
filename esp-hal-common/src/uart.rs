@@ -189,6 +189,13 @@ pub mod config {
             }
         }
     }
+
+    pub enum RxTimeoutConfig {
+        /// Disable Rx timeout interrupt generation
+        Disabled,
+        /// Timeout after that many bits/bytes (depending on chip... TODO)
+        Timeout(u16),
+    }
 }
 
 /// Pins used by the UART interface
@@ -396,6 +403,29 @@ where
             Err(nb::Error::WouldBlock)
         }
     }
+
+    /// Read all available bytes from the RX FIFO into the provided buffer and
+    /// returns the number of read bytes. Never blocks
+    pub fn drain_fifo(&mut self, buf: &mut [u8]) -> usize {
+        #[allow(unused_variables)]
+        let offset = 0;
+
+        // on ESP32-S2 we need to use PeriBus2 to read the FIFO
+        #[cfg(esp32s2)]
+        let offset = 0x20c00000;
+
+        let mut count = 0;
+        while T::get_rx_fifo_count() > 0 && count < buf.len() {
+            let value = unsafe {
+                let fifo = (T::register_block().fifo.as_ptr() as *mut u8).offset(offset)
+                    as *mut crate::peripherals::generic::Reg<FIFO_SPEC>;
+                (*fifo).read().rxfifo_rd_byte().bits()
+            };
+            buf[count] = value;
+            count += 1;
+        }
+        count
+    }
 }
 
 impl<'d, T> Uart<'d, T>
@@ -497,6 +527,28 @@ where
 
         self.sync_regs();
         self.rx.at_cmd_config = Some(config);
+    }
+
+    /// Configures the Rx timeout settings.
+    pub fn set_rx_timeout(&mut self, config: config::RxTimeoutConfig) {
+        // TODO: fix this
+        // This only works for esp32-c6 etc, because the timeout conf is not in the same
+        // register on all chips (esp32: UART_CONF1_REG)
+        match config {
+            config::RxTimeoutConfig::Disabled => {
+                T::register_block()
+                    .tout_conf
+                    .write(|w| w.rx_tout_en().clear_bit());
+            }
+            config::RxTimeoutConfig::Timeout(bits) => {
+                T::register_block()
+                    .tout_conf
+                    .write(|w| unsafe { w.rx_tout_thrhd().bits(bits) });
+                T::register_block()
+                    .tout_conf
+                    .modify(|_, w| w.rx_tout_en().set_bit());
+            }
+        }
     }
 
     /// Configures the RX-FIFO threshold
@@ -1191,28 +1243,27 @@ where
     T: Instance,
 {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        let mut count = 0;
-        loop {
-            if count >= buf.len() {
-                break;
-            }
+        if buf.len() == 0 {
+            return Ok(0);
+        }
 
+        let count = self.drain_fifo(buf);
+        if count > 0 {
+            return Ok(count);
+        }
+
+        loop {
             match self.read_byte() {
                 Ok(byte) => {
-                    buf[count] = byte;
-                    count += 1;
+                    buf[0] = byte;
+                    return Ok(1);
                 }
                 Err(nb::Error::WouldBlock) => {
                     // Block until we have read at least one byte
-                    if count > 0 {
-                        break;
-                    }
                 }
                 Err(nb::Error::Other(e)) => return Err(e),
             }
         }
-
-        Ok(count)
     }
 }
 
@@ -1254,8 +1305,8 @@ where
 mod asynch {
     use core::{marker::PhantomData, task::Poll};
 
+    use bitflags::bitflags;
     use cfg_if::cfg_if;
-    use embassy_futures::select::{select, select3, Either, Either3};
     use embassy_sync::waitqueue::AtomicWaker;
     use procmacros::interrupt;
 
@@ -1280,88 +1331,94 @@ mod asynch {
     const INIT: AtomicWaker = AtomicWaker::new();
     static WAKERS: [AtomicWaker; NUM_UART] = [INIT; NUM_UART];
 
-    pub(crate) enum Event {
-        TxDone,
-        TxFiFoEmpty,
-        RxFifoFull,
-        RxCmdCharDetected,
-        RxFifoOvf,
+    bitflags! {
+        /// Bitmasks for the INT_ENA, INT_RAW and INT_CLR registers
+        /// Unfortunately, we cannot get them from the svd2rust generated PAC-code, without having to issue a register read first.
+        /// TODO: bit 19 for certain chips
+        /// TODO: Validate bits 0-18 are really the same for all chips
+        #[derive(Copy, Clone)]
+        pub struct UartInterrupt: u32 {
+            const RXFIFO_FULL = 1 << 0;
+            const TXFIFO_EMPTY = 1 << 1;
+            const PARITY_ERR = 1 << 2;
+            const FRM_ERR = 1 << 3;
+            const RXFIFO_OVF = 1 << 4;
+            const DSR_CHG = 1 << 5;
+            const CTS_CHG = 1 << 6;
+            const BRK_DET = 1 << 7;
+            const RXFIFO_TOUT = 1 << 8;
+            const SW_XON = 1 << 9;
+            const SW_XOFF = 1 << 10;
+            const GLITCH_DET = 1 << 11;
+            const TX_BRK_DONE = 1 << 12;
+            const TX_BRK_IDLE_DONE = 1 << 13;
+            const TX_DONE = 1 << 14;
+            const RS485_PARITY_ERR = 1 << 15;
+            const RS485_FRM_ERR = 1 << 16;
+            const RS485_CLASH = 1 << 17;
+            const AT_CMD_CHAR_DET = 1 << 18;
+        }
     }
 
+    /// A future that resolves when one of the passed interrupts is triggered,
+    /// or has been triggered in the meantime (flag set in INT_RAW).
+    /// Upon construction the future enables all passed interrupts and when it
+    /// resolves it disables them again (no matter if they were enabled before
+    /// the future) and it returns the interrupt(s) that triggered the
+    /// future to complete
     pub(crate) struct UartFuture<'d, T: Instance> {
-        event: Event,
+        interrupts: UartInterrupt,
         phantom: PhantomData<&'d mut T>,
     }
 
     impl<'d, T: Instance> UartFuture<'d, T> {
-        pub fn new(event: Event) -> Self {
-            match event {
-                Event::TxDone => T::register_block()
-                    .int_ena
-                    .modify(|_, w| w.tx_done_int_ena().set_bit()),
-                Event::TxFiFoEmpty => T::register_block()
-                    .int_ena
-                    .modify(|_, w| w.txfifo_empty_int_ena().set_bit()),
-                Event::RxFifoFull => T::register_block()
-                    .int_ena
-                    .modify(|_, w| w.rxfifo_full_int_ena().set_bit()),
-                Event::RxCmdCharDetected => T::register_block()
-                    .int_ena
-                    .modify(|_, w| w.at_cmd_char_det_int_ena().set_bit()),
-                Event::RxFifoOvf => T::register_block()
-                    .int_ena
-                    .modify(|_, w| w.rxfifo_ovf_int_ena().set_bit()),
-            }
-
+        /// Crates a future that resolves when one of the passed interrupts is
+        /// triggered
+        ///
+        /// # Params
+        /// - `interrupts` bitmask of interrupts to listen for
+        pub fn new(interrupts: UartInterrupt) -> Self {
+            T::register_block()
+                .int_ena
+                .modify(|r, w| unsafe { w.bits(r.bits() | interrupts.bits()) });
             Self {
-                event,
+                interrupts,
                 phantom: PhantomData,
             }
         }
 
-        fn event_bit_is_clear(&self) -> bool {
-            match self.event {
-                Event::TxDone => T::register_block()
-                    .int_ena
-                    .read()
-                    .tx_done_int_ena()
-                    .bit_is_clear(),
-                Event::TxFiFoEmpty => T::register_block()
-                    .int_ena
-                    .read()
-                    .txfifo_empty_int_ena()
-                    .bit_is_clear(),
-                Event::RxFifoFull => T::register_block()
-                    .int_ena
-                    .read()
-                    .rxfifo_full_int_ena()
-                    .bit_is_clear(),
-                Event::RxCmdCharDetected => T::register_block()
-                    .int_ena
-                    .read()
-                    .at_cmd_char_det_int_ena()
-                    .bit_is_clear(),
-                Event::RxFifoOvf => T::register_block()
-                    .int_ena
-                    .read()
-                    .rxfifo_ovf_int_ena()
-                    .bit_is_clear(),
-            }
+        fn occured_interrupts(&self) -> UartInterrupt {
+            // The interrupt handler clears and disables all interrupts that occur
+            // and have their enable bit set
+            let still_enabled_interrupts =
+                UartInterrupt::from_bits_truncate(T::register_block().int_ena.read().bits());
+            // return only the interrupts that we have initially enabled
+            self.interrupts.difference(still_enabled_interrupts)
+        }
+
+        fn disable_interrupts(&self) {
+            // Because the interrupt handler only disables the interrupts that have occured,
+            // we have to disabled the remaining interrupts (that we have enabled ourselves)
+            T::register_block()
+                .int_ena
+                .modify(|r, w| unsafe { w.bits(r.bits() & self.interrupts.complement().bits()) });
         }
     }
 
     impl<'d, T: Instance> core::future::Future for UartFuture<'d, T> {
-        type Output = ();
+        type Output = UartInterrupt;
 
         fn poll(
             self: core::pin::Pin<&mut Self>,
             cx: &mut core::task::Context<'_>,
         ) -> core::task::Poll<Self::Output> {
             WAKERS[T::uart_number()].register(cx.waker());
-            if self.event_bit_is_clear() {
-                Poll::Ready(())
-            } else {
+            let occured_interrupts = self.occured_interrupts();
+            if occured_interrupts.is_empty() {
                 Poll::Pending
+            } else {
+                self.disable_interrupts();
+                Poll::Ready(occured_interrupts)
             }
         }
     }
@@ -1370,22 +1427,7 @@ mod asynch {
     where
         T: Instance,
     {
-        /// Read async to buffer slice `buf`. Wait for Rx Fifo Full interrupt
-        /// (set by `set_rx_fifo_full_threshold`) and/or Rx AT_CMD character
-        /// interrupt if `set_at_cmd` was called.
-        ///
-        /// # Params
-        /// - `buf` buffer slice to write the bytes into
-        ///
-        /// # Errors
-        /// - `Err(RxFifoOvf)` when MCU Rx Fifo Overflow interrupt is triggered.
-        ///   To avoid this error, call this function more often.
-        /// - `Err(Error::ReadNoConfig)` if neither `set_rx_fifo_full_threshold`
-        ///   or `set_at_cmd` was called
-        ///
-        /// # Ok
-        /// When succesfull, returns the number of bytes written to
-        /// buf
+        /// See [`UartRx::read_async`]
         async fn read_async(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
             self.rx.read_async(buf).await
         }
@@ -1422,7 +1464,7 @@ mod asynch {
                 }
 
                 offset = next_offset;
-                UartFuture::<T>::new(Event::TxFiFoEmpty).await;
+                UartFuture::<T>::new(UartInterrupt::TXFIFO_EMPTY).await;
             }
 
             Ok(count)
@@ -1431,7 +1473,7 @@ mod asynch {
         async fn flush_async(&mut self) -> Result<(), Error> {
             let count = T::get_tx_fifo_count();
             if count > 0 {
-                UartFuture::<T>::new(Event::TxDone).await;
+                UartFuture::<T>::new(UartInterrupt::TX_DONE).await;
             }
 
             Ok(())
@@ -1442,9 +1484,17 @@ mod asynch {
     where
         T: Instance,
     {
-        /// Read async to buffer slice `buf`. Wait for Rx Fifo Full interrupt
-        /// (set by `set_rx_fifo_full_threshold`) and/or Rx AT_CMD character
-        /// interrupt if `set_at_cmd` was called.
+        /// Read async to buffer slice `buf`.
+        /// Waits until one of the following interrupts occurs:
+        /// - `RXFIFO_FULL`
+        /// - `RXFIFO_OVF`
+        /// - `AT_CMD_CHAR_DET` (only if `set_at_cmd` was called)
+        /// - `RXFIFO_TOUT` (only if `set_rx_timeout was called)
+        ///
+        /// The interrupts in question are enabled during the body of this
+        /// function. The method immediately returns when the interrupt
+        /// has already occured before calling this method (e.g. status
+        /// bit set, but interrupt not enabled)
         ///
         /// # Params
         /// - `buf` buffer slice to write the bytes into
@@ -1452,50 +1502,38 @@ mod asynch {
         /// # Errors
         /// - `Err(RxFifoOvf)` when MCU Rx Fifo Overflow interrupt is triggered.
         ///   To avoid this error, call this function more often.
-        /// - `Err(Error::ReadNoConfig)` if neither `set_rx_fifo_full_threshold`
-        ///   or `set_at_cmd` was called
         ///
         /// # Ok
-        /// When succesfull, returns the number of bytes written to
-        /// buf
+        /// When succesfull, returns the number of bytes written to buf
         async fn read_async(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
             if buf.len() == 0 {
                 return Ok(0);
             }
 
-            let mut read_bytes = 0;
+            let mut interrupts_to_await = UartInterrupt::RXFIFO_FULL | UartInterrupt::RXFIFO_OVF;
 
             if self.at_cmd_config.is_some() {
-                if let Either3::Third(_) = select3(
-                    UartFuture::<T>::new(Event::RxCmdCharDetected),
-                    UartFuture::<T>::new(Event::RxFifoFull),
-                    UartFuture::<T>::new(Event::RxFifoOvf),
-                )
-                .await
-                {
-                    return Err(Error::RxFifoOvf);
-                }
-            } else {
-                if let Either::Second(_) = select(
-                    UartFuture::<T>::new(Event::RxFifoFull),
-                    UartFuture::<T>::new(Event::RxFifoOvf),
-                )
-                .await
-                {
-                    return Err(Error::RxFifoOvf);
-                }
+                interrupts_to_await |= UartInterrupt::AT_CMD_CHAR_DET;
             }
 
-            while let Ok(byte) = self.read_byte() {
-                if read_bytes < buf.len() {
-                    buf[read_bytes] = byte;
-                    read_bytes += 1;
-                } else {
-                    break;
-                }
+            // TODO: Abstract this
+            // This only works for esp32-c6 etc, because the timeout conf is not in the same
+            // register on all chips (esp32: UART_CONF1_REG)
+            if T::register_block()
+                .tout_conf
+                .read()
+                .rx_tout_en()
+                .bit_is_set()
+            {
+                interrupts_to_await |= UartInterrupt::RXFIFO_TOUT;
             }
 
-            Ok(read_bytes)
+            let occured_interrupts = UartFuture::<T>::new(interrupts_to_await).await;
+            if occured_interrupts.contains(UartInterrupt::RXFIFO_OVF) {
+                return Err(Error::RxFifoOvf);
+            }
+
+            Ok(self.drain_fifo(buf))
         }
     }
 
@@ -1503,6 +1541,9 @@ mod asynch {
     where
         T: Instance,
     {
+        /// In contrast to the documentation of embedded_io_async::Read, this
+        /// method blocks until an uart interrupt occurs.
+        /// See UartRx::read_async for more details.
         async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
             self.read_async(buf).await
         }
@@ -1512,6 +1553,9 @@ mod asynch {
     where
         T: Instance,
     {
+        /// In contrast to the documentation of embedded_io_async::Read, this
+        /// method blocks until an uart interrupt occurs.
+        /// See UartRx::read_async for more details.
         async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
             self.read_async(buf).await
         }
@@ -1543,57 +1587,23 @@ mod asynch {
         }
     }
 
+    /// Interrupt handler for all UART instances
+    /// Clears and disables interrupts that have occured and have their enable
+    /// bit set The fact that an interrupt has been disabled is used by the
+    /// futures to detect that they should indeed resolve after being woken up
     fn intr_handler(uart: &RegisterBlock) -> bool {
-        let int_raw_val = uart.int_raw.read();
-        let int_ena_val = uart.int_ena.read();
+        let occured_interrupts = UartInterrupt::from_bits_truncate(uart.int_raw.read().bits());
+        let enabled_interrupts = UartInterrupt::from_bits_truncate(uart.int_ena.read().bits());
 
-        let mut wake = false;
-
-        if int_ena_val.txfifo_empty_int_ena().bit_is_set()
-            && int_raw_val.txfifo_empty_int_raw().bit_is_set()
-        {
-            uart.int_clr.write(|w| w.txfifo_empty_int_clr().set_bit());
-            uart.int_ena
-                .modify(|_, w| w.txfifo_empty_int_ena().clear_bit());
-            wake = true;
+        let relevant_interrupts = occured_interrupts.intersection(enabled_interrupts);
+        if relevant_interrupts.is_empty() {
+            return false;
         }
-
-        if int_ena_val.tx_done_int_ena().bit_is_set() && int_raw_val.tx_done_int_raw().bit_is_set()
-        {
-            uart.int_clr.write(|w| w.tx_done_int_clr().set_bit());
-            uart.int_ena.modify(|_, w| w.tx_done_int_ena().clear_bit());
-            wake = true;
-        }
-
-        if int_ena_val.at_cmd_char_det_int_ena().bit_is_set()
-            && int_raw_val.at_cmd_char_det_int_raw().bit_is_set()
-        {
-            uart.int_clr
-                .write(|w| w.at_cmd_char_det_int_clr().set_bit());
-            uart.int_ena
-                .modify(|_, w| w.at_cmd_char_det_int_ena().clear_bit());
-            wake = true;
-        }
-
-        if int_ena_val.rxfifo_full_int_ena().bit_is_set()
-            && int_raw_val.rxfifo_full_int_raw().bit_is_set()
-        {
-            uart.int_clr.write(|w| w.rxfifo_full_int_clr().set_bit());
-            uart.int_ena
-                .modify(|_, w| w.rxfifo_full_int_ena().clear_bit());
-            wake = true;
-        }
-
-        if int_ena_val.rxfifo_ovf_int_ena().bit_is_set()
-            && int_raw_val.rxfifo_ovf_int_raw().bit_is_set()
-        {
-            uart.int_clr.write(|w| w.rxfifo_ovf_int_clr().set_bit());
-            uart.int_ena
-                .modify(|_, w| w.rxfifo_ovf_int_ena().clear_bit());
-            wake = true;
-        }
-
-        wake
+        uart.int_clr
+            .write(|w| unsafe { w.bits(relevant_interrupts.bits()) });
+        uart.int_ena
+            .modify(|r, w| unsafe { w.bits(r.bits() & relevant_interrupts.complement().bits()) });
+        true
     }
 
     #[cfg(uart0)]
