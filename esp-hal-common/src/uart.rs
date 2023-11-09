@@ -532,20 +532,20 @@ where
     /// Configures the Rx timeout settings.
     pub fn set_rx_timeout(&mut self, config: config::RxTimeoutConfig) {
         // TODO: fix this
-        // This only works for esp32-c6 etc, because the timeout conf is not in the same
+        // This only works for esp32-c3 etc, because the timeout conf is not in the same
         // register on all chips (esp32: UART_CONF1_REG)
         match config {
             config::RxTimeoutConfig::Disabled => {
                 T::register_block()
-                    .tout_conf
+                    .conf1
                     .write(|w| w.rx_tout_en().clear_bit());
             }
             config::RxTimeoutConfig::Timeout(bits) => {
                 T::register_block()
-                    .tout_conf
-                    .write(|w| unsafe { w.rx_tout_thrhd().bits(bits) });
+                    .idle_conf
+                    .write(|w| unsafe { w.rx_idle_thrhd().bits(bits) });
                 T::register_block()
-                    .tout_conf
+                    .conf1
                     .modify(|_, w| w.rx_tout_en().set_bit());
             }
         }
@@ -1520,7 +1520,7 @@ mod asynch {
             // This only works for esp32-c6 etc, because the timeout conf is not in the same
             // register on all chips (esp32: UART_CONF1_REG)
             if T::register_block()
-                .tout_conf
+                .conf1
                 .read()
                 .rx_tout_en()
                 .bit_is_set()
